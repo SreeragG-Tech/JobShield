@@ -34,12 +34,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOADS_DIR = os.path.join(BACKEND_DIR, "uploads")
-BACKUPS_DIR = os.path.join(BACKEND_DIR, "backups")
-HISTORY_FILE = os.path.join(BACKEND_DIR, "model_history.json")
-VERSION_FILE = os.path.join(BACKEND_DIR, "model_version.json")
-PRIMARY_MODEL_PATH = os.path.join(BACKEND_DIR, "nlp_model.joblib")
+# Absolute path to the backend directory and model file using os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BACKEND_DIR = BASE_DIR
+MODEL_PATH = os.path.join(BASE_DIR, "nlp_model.joblib")
+PRIMARY_MODEL_PATH = MODEL_PATH
+
+UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
+BACKUPS_DIR = os.path.join(BASE_DIR, "backups")
+HISTORY_FILE = os.path.join(BASE_DIR, "model_history.json")
+VERSION_FILE = os.path.join(BASE_DIR, "model_version.json")
 
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 os.makedirs(BACKUPS_DIR, exist_ok=True)
@@ -52,53 +56,106 @@ loaded_pipeline = None
 loaded_model = None
 loaded_vectorizer = None
 loaded_artifact_name: Optional[str] = None
+model_load_error: Optional[str] = None
 
 
 def load_artifacts():
-    global loaded_pipeline, loaded_model, loaded_vectorizer, loaded_artifact_name
+    global loaded_pipeline, loaded_model, loaded_vectorizer, loaded_artifact_name, model_load_error
 
-    # 1. First check if a combined Pipeline artifact exists
-    possible_pipelines = [
-        PRIMARY_MODEL_PATH,
-        os.path.join(BACKEND_DIR, "nlp_model.pkl"),
-        os.path.join(BACKEND_DIR, "model.joblib"),
-        os.path.join(BACKEND_DIR, "model.pkl"),
+    # Explicit absolute path constructed with os.path.dirname(os.path.abspath(__file__))
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(base_dir, "nlp_model.joblib")
+
+    model_load_error = None
+    print(f"[JobShield AI] Looking for trained model at absolute path: {model_path}")
+
+    # 1. Primary check: Exact absolute path to nlp_model.joblib in the backend folder
+    if os.path.exists(model_path):
+        try:
+            artifact = joblib.load(model_path)
+            if hasattr(artifact, "predict_proba"):
+                loaded_pipeline = artifact
+                loaded_artifact_name = "nlp_model.joblib"
+                print(f"[JobShield AI] Successfully loaded model pipeline from: {model_path}")
+                return True
+            elif hasattr(artifact, "predict"):
+                loaded_pipeline = artifact
+                loaded_artifact_name = "nlp_model.joblib"
+                print(f"[JobShield AI] Loaded model classifier with predict() from: {model_path}")
+                return True
+            elif isinstance(artifact, dict):
+                if "pipeline" in artifact:
+                    loaded_pipeline = artifact["pipeline"]
+                    loaded_artifact_name = "nlp_model.joblib"
+                    print(f"[JobShield AI] Loaded pipeline dictionary from: {model_path}")
+                    return True
+                elif ("model" in artifact or "classifier" in artifact) and ("vectorizer" in artifact or "tfidf" in artifact):
+                    loaded_model = artifact.get("model") or artifact.get("classifier")
+                    loaded_vectorizer = artifact.get("vectorizer") or artifact.get("tfidf")
+                    loaded_artifact_name = "nlp_model.joblib"
+                    print(f"[JobShield AI] Loaded model and vectorizer dictionary from: {model_path}")
+                    return True
+            elif isinstance(artifact, (list, tuple)) and len(artifact) == 2:
+                if hasattr(artifact[0], "transform") and hasattr(artifact[1], "predict"):
+                    loaded_vectorizer, loaded_model = artifact[0], artifact[1]
+                    loaded_artifact_name = "nlp_model.joblib"
+                    return True
+                elif hasattr(artifact[1], "transform") and hasattr(artifact[0], "predict"):
+                    loaded_model, loaded_vectorizer = artifact[0], artifact[1]
+                    loaded_artifact_name = "nlp_model.joblib"
+                    return True
+            else:
+                model_load_error = f"Loaded artifact from {model_path} has unsupported type {type(artifact).__name__}"
+                print(f"[JobShield AI] {model_load_error}")
+        except Exception as e:
+            model_load_error = f"Error loading model from {model_path}: {str(e)}"
+            print(f"[JobShield AI] {model_load_error}")
+
+    # 2. Check alternate possible filenames in base_dir or root working directory
+    alternate_paths = [
+        os.path.join(base_dir, "nlp_model.pkl"),
+        os.path.join(base_dir, "model.joblib"),
+        os.path.join(base_dir, "model.pkl"),
+        os.path.join(os.getcwd(), "backend", "nlp_model.joblib"),
+        os.path.join(os.getcwd(), "nlp_model.joblib"),
     ]
-    for path in possible_pipelines:
-        if os.path.exists(path):
+    for alt_path in alternate_paths:
+        if alt_path != model_path and os.path.exists(alt_path):
             try:
-                artifact = joblib.load(path)
-                if hasattr(artifact, "predict_proba"):
+                artifact = joblib.load(alt_path)
+                if hasattr(artifact, "predict_proba") or hasattr(artifact, "predict"):
                     loaded_pipeline = artifact
-                    loaded_artifact_name = os.path.basename(path)
-                    print(f"[JobShield AI] Successfully loaded model pipeline from: {path}")
+                    loaded_artifact_name = os.path.basename(alt_path)
+                    print(f"[JobShield AI] Successfully loaded model from fallback path: {alt_path}")
                     return True
             except Exception as e:
-                print(f"[JobShield AI] Error loading {path}: {e}")
+                print(f"[JobShield AI] Error loading fallback {alt_path}: {e}")
 
-    # 2. Check if model and vectorizer were saved separately
-    model_path = None
-    vec_path = None
-    for p in [os.path.join(BACKEND_DIR, "clf.joblib"), os.path.join(BACKEND_DIR, "classifier.joblib")]:
+    # 3. Check if model and vectorizer were saved separately
+    model_candidate = None
+    vec_candidate = None
+    for p in [os.path.join(base_dir, "clf.joblib"), os.path.join(base_dir, "classifier.joblib")]:
         if os.path.exists(p):
-            model_path = p
+            model_candidate = p
             break
-    for p in [os.path.join(BACKEND_DIR, "vectorizer.joblib"), os.path.join(BACKEND_DIR, "tfidf.joblib")]:
+    for p in [os.path.join(base_dir, "vectorizer.joblib"), os.path.join(base_dir, "tfidf.joblib")]:
         if os.path.exists(p):
-            vec_path = p
+            vec_candidate = p
             break
 
-    if model_path and vec_path:
+    if model_candidate and vec_candidate:
         try:
-            loaded_model = joblib.load(model_path)
-            loaded_vectorizer = joblib.load(vec_path)
-            loaded_artifact_name = f"{os.path.basename(model_path)} + {os.path.basename(vec_path)}"
-            print(f"[JobShield AI] Successfully loaded separate model and vectorizer: {loaded_artifact_name}")
+            loaded_model = joblib.load(model_candidate)
+            loaded_vectorizer = joblib.load(vec_candidate)
+            loaded_artifact_name = f"{os.path.basename(model_candidate)} + {os.path.basename(vec_candidate)}"
+            print(f"[JobShield AI] Successfully loaded separate model and vectorizer from: {base_dir}")
             return True
         except Exception as e:
             print(f"[JobShield AI] Error loading separate artifacts: {e}")
 
-    print("[JobShield AI] Notice: No trained model file found yet in backend directory.")
+    if not model_load_error:
+        model_load_error = f"Model file not found at {model_path}. Please verify 'nlp_model.joblib' is located in '{base_dir}'."
+    print(f"[JobShield AI] {model_load_error}")
     return False
 
 
@@ -180,8 +237,10 @@ def add_history_entry(action: str, file_name: str, status: str, summary: str, ve
     save_history_items(history[:50])  # keep last 50
 
 
-# Load artifacts on server boot
-load_artifacts()
+# Load artifacts on server startup
+@app.on_event("startup")
+def startup_event():
+    load_artifacts()
 
 
 # Admin Security Check
@@ -306,13 +365,20 @@ def health_check():
 
     is_ready = loaded_pipeline is not None or (loaded_model is not None and loaded_vectorizer is not None)
     version_info = get_version_info()
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(base_dir, "nlp_model.joblib")
+
     return {
         "status": "online",
         "service": "JobShield AI FastAPI Backend",
         "model_loaded": is_ready,
         "model_artifact": loaded_artifact_name,
+        "model_path": model_path,
+        "model_file_exists": os.path.exists(model_path),
+        "model_load_error": model_load_error if not is_ready else None,
         "version": version_info.get("version", "v1.0.0"),
-        "backend_directory": BACKEND_DIR,
+        "backend_directory": base_dir,
+        "working_directory": os.getcwd(),
     }
 
 
@@ -325,26 +391,46 @@ def predict_job(payload: JobPostingRequest):
         load_artifacts()
 
     if loaded_pipeline is None and (loaded_model is None or loaded_vectorizer is None):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(base_dir, "nlp_model.joblib")
         raise HTTPException(
             status_code=503,
             detail=(
-                "Trained model artifact not found. Please upload your model via the 'Update Dataset & Model' section, "
-                "or place 'nlp_model.joblib' directly inside the backend/ folder."
+                f"Trained model artifact is not loaded. Checked path: {model_path}. "
+                f"File exists: {os.path.exists(model_path)}. "
+                f"Error: {model_load_error or 'No model available in backend directory.'}"
             )
         )
 
     try:
         if loaded_pipeline is not None:
-            df_row, _ = build_feature_dataframe(payload)
-            probabilities = loaded_pipeline.predict_proba(df_row)[0]
-            fraud_prob = round(float(probabilities[1]), 4)
-            legit_prob = round(float(probabilities[0]), 4)
+            df_row, combined_text = build_feature_dataframe(payload)
+            if hasattr(loaded_pipeline, "predict_proba"):
+                try:
+                    probabilities = loaded_pipeline.predict_proba(df_row)[0]
+                except Exception:
+                    probabilities = loaded_pipeline.predict_proba([combined_text])[0]
+                fraud_prob = round(float(probabilities[1]), 4)
+                legit_prob = round(float(probabilities[0]), 4)
+            else:
+                try:
+                    pred = loaded_pipeline.predict(df_row)[0]
+                except Exception:
+                    pred = loaded_pipeline.predict([combined_text])[0]
+                fraud_prob = 1.0 if int(pred) == 1 else 0.0
+                legit_prob = 1.0 - fraud_prob
+
         elif loaded_model is not None and loaded_vectorizer is not None:
             _, combined_text = build_feature_dataframe(payload)
             X_vec = loaded_vectorizer.transform([combined_text])
-            probabilities = loaded_model.predict_proba(X_vec)[0]
-            fraud_prob = round(float(probabilities[1]), 4)
-            legit_prob = round(float(probabilities[0]), 4)
+            if hasattr(loaded_model, "predict_proba"):
+                probabilities = loaded_model.predict_proba(X_vec)[0]
+                fraud_prob = round(float(probabilities[1]), 4)
+                legit_prob = round(float(probabilities[0]), 4)
+            else:
+                pred = loaded_model.predict(X_vec)[0]
+                fraud_prob = 1.0 if int(pred) == 1 else 0.0
+                legit_prob = 1.0 - fraud_prob
         else:
             raise HTTPException(status_code=500, detail="Model is not configured properly.")
 
